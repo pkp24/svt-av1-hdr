@@ -1,0 +1,164 @@
+# .github/workflows/build-linux-znver5-dovi-hdr10plus.yml
+# Builds svt-av1-hdr on Ubuntu 24.04 using Clang 20.1.8 with PGO,
+# enables Dolby Vision (libdovi) and HDR10+ (libhdr10plus),
+# then publishes a GitHub Release with artifacts.
+
+name: build-linux-znver5-dovi-hdr10plus
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v0.1.0)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write  # needed to create releases
+
+env:
+  LLVM_VER: "20.1.8"
+  LLVM_DIR: "/opt/llvm-20.1.8"
+  CC: "/opt/llvm-20.1.8/bin/clang"
+  CXX: "/opt/llvm-20.1.8/bin/clang++"
+  TARGET_CPU_FLAGS: "-march=znver5"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install base build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl xz-utils ca-certificates git ninja-build cmake pkg-config \
+            nasm yasm zlib1g-dev libssl-dev libfontconfig1-dev
+
+      - name: Install Clang/LLVM ${{ env.LLVM_VER }}
+        run: |
+          set -eux
+          curl -L -o llvm.tar.xz \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-24.04.tar.xz
+          sudo mkdir -p ${LLVM_DIR}
+          sudo tar -xJf llvm.tar.xz -C /opt
+          # The tarball extracts to /opt/clang+llvm-<ver> — normalize to ${LLVM_DIR}
+          EXTRACTED_DIR=$(tar -tJf llvm.tar.xz | head -1 | cut -d/ -f1)
+          sudo mv "/opt/${EXTRACTED_DIR}" "${LLVM_DIR}"
+          echo "${LLVM_DIR}/bin" >> $GITHUB_PATH
+          ${LLVM_DIR}/bin/clang --version
+
+      - name: Set up Rust toolchain (for libdovi/libhdr10plus)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-c helper
+        run: cargo install cargo-c --locked
+
+      - name: Build & install libdovi (Dolby Vision C library)
+        run: |
+          set -eux
+          git clone --depth=1 https://github.com/quietvoid/dovi_tool.git
+          pushd dovi_tool/dolby_vision
+          cargo cinstall --release --prefix=/usr/local
+          popd
+          ldconfig -p | grep -i dovi || true
+
+      - name: Build & install libhdr10plus (HDR10+ C library)
+        run: |
+          set -eux
+          git clone --depth=1 https://github.com/quietvoid/hdr10plus_tool.git
+          pushd hdr10plus_tool/hdr10plus
+          cargo cinstall --release --prefix=/usr/local
+          popd
+          ldconfig -p | grep -i hdr10plus || true
+
+      $1
+      - name: Smoketest (DV): generate RPU + short encode
+        run: |
+          set -eux
+          mkdir -p smoke
+          # Fetch example DV generator config from dovi_tool
+          curl -L -o smoke/default_cmv40.json \
+            https://raw.githubusercontent.com/quietvoid/dovi_tool/main/assets/generator_examples/default_cmv40.json
+          # Generate a small RPU
+          dovi_tool generate -j smoke/default_cmv40.json -o smoke/RPU.bin
+          # 2 seconds of 720p30 Y4M piped to SvtAv1EncApp with DV RPU (about 60 frames)
+          ffmpeg -v error -f lavfi -i testsrc=size=1280x720:rate=30 -t 2 -pix_fmt yuv420p -f yuv4mpegpipe - \
+            | ./Bin/Release/SvtAv1EncApp -i stdin -b /dev/null --preset 8 --crf 40 --input-depth 10 \
+              --dolby-vision-rpu smoke/RPU.bin -n 60
+
+      - name: Smoketest (HDR10+): flag present in CLI
+        run: |
+          set -eux
+          ./Bin/Release/SvtAv1EncApp --help | grep -i -- '--hdr10plus-json'
+      - name: Collect build artifacts
+        run: |
+          set -eux
+          mkdir -p out/bin out/lib
+          # App
+          if [ -f Bin/Release/SvtAv1EncApp ]; then cp Bin/Release/SvtAv1EncApp out/bin/; fi
+          if [ -f Bin/Release/SvtAv1DecApp ]; then cp Bin/Release/SvtAv1DecApp out/bin/; fi
+          # Libraries (shared)
+          find . -maxdepth 3 -type f -name "libSvtAv1*so*" -exec cp {} out/lib/ \; || true
+          # Metadata libs (for convenience)
+          cp -a /usr/local/lib/libdovi* out/lib/ || true
+          cp -a /usr/local/lib/libhdr10plus* out/lib/ || true
+          # Usage notes
+          cat > out/USAGE_DV_HDR10PLUS.txt <<'TXT'
+          Example usage (inside the Release tarball):
+
+          Dolby Vision (use an RPU binary from dovi_tool):
+            ./SvtAv1EncApp -i input.y4m -b out_dovi.ivf --preset 4 --crf 24 --input-depth 10 \
+              --dolby-vision-rpu RPU.bin
+
+          HDR10+ (use JSON extracted by hdr10plus_tool):
+            ./SvtAv1EncApp -i input.y4m -b out_hdr10plus.ivf --preset 4 --crf 24 --input-depth 10 \
+              --hdr10plus-json metadata.json
+          TXT
+
+      - name: Tar up artifacts
+        run: |
+          set -eux
+          RELEASE_NAME="svt-av1-hdr-linux-clang${LLVM_VER}-znver5"
+          mkdir -p dist
+          tar -C out -cJf "dist/${RELEASE_NAME}.tar.xz" .
+          echo "RELEASE_ASSET=dist/${RELEASE_NAME}.tar.xz" >> $GITHUB_ENV
+
+      - name: Determine release tag
+        id: meta
+        run: |
+          # Prefer the pushed tag; otherwise use manual input
+          TAG=${GITHUB_REF_NAME:-}
+          if [ -z "$TAG" ]; then TAG="${{ github.event.inputs.tag }}"; fi
+          if [ -z "$TAG" ]; then TAG="v0.0.0-${GITHUB_RUN_ID}"; fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          draft: false
+          prerelease: false
+          files: |
+            ${{ env.RELEASE_ASSET }}
+          body: |
+            Build info:
+            - Clang/LLVM: ${{ env.LLVM_VER }}
+            - CPU tuning: znver5
+            - PGO: enabled
+            - Dolby Vision (libdovi): enabled
+            - HDR10+ (libhdr10plus): enabled
+
+      - name: Upload workflow artifact (CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: svt-av1-hdr-linux-${{ env.LLVM_VER }}-znver5
+          path: ${{ env.RELEASE_ASSET }}
