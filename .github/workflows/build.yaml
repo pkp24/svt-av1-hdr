@@ -1,9 +1,9 @@
-# .github/workflows/build-linux-znver5-dovi-hdr10plus.yml
-# Builds svt-av1-hdr on Ubuntu 24.04 using Clang 20.1.8 with PGO,
+# .github/workflows/build-windows-znver4-dovi-hdr10plus.yml
+# Builds svt-av1-hdr for Windows on Ubuntu 24.04 using MinGW cross-compilation with PGO,
 # enables Dolby Vision (libdovi) and HDR10+ (libhdr10plus),
 # then publishes a GitHub Release with artifacts.
 
-name: build-linux-znver5-dovi-hdr10plus
+name: build-windows-znver4-dovi-hdr10plus
 
 on:
   push:
@@ -20,11 +20,11 @@ permissions:
   contents: write  # needed to create releases
 
 env:
-  LLVM_VER: "20.1.8"
-  LLVM_DIR: "/opt/llvm-20.1.8"
-  CC: "/opt/llvm-20.1.8/bin/clang"
-  CXX: "/opt/llvm-20.1.8/bin/clang++"
-  TARGET_CPU_FLAGS: "-march=znver5"
+  LLVM_VER: "20.1.0"
+  LLVM_DIR: "/opt/llvm-20.1.0"
+  CC: "/opt/llvm-20.1.0/bin/clang"
+  CXX: "/opt/llvm-20.1.0/bin/clang++"
+  TARGET_CPU_FLAGS: "-march=znver4"
 
 jobs:
   build:
@@ -33,23 +33,38 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Set up Rust environment
+        run: |
+          echo "CARGO_HOME=$HOME/.cargo" >> $GITHUB_ENV
+          echo "RUSTUP_HOME=$HOME/.rustup" >> $GITHUB_ENV
+          mkdir -p $HOME/.cargo $HOME/.rustup
+          chmod 755 $HOME/.cargo $HOME/.rustup
+
       - name: Install base build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             curl xz-utils ca-certificates git ninja-build cmake pkg-config \
-            nasm yasm zlib1g-dev libssl-dev libfontconfig1-dev
+            nasm yasm zlib1g-dev libssl-dev libfontconfig1-dev ffmpeg \
+            mingw-w64 gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+
+      - name: Cache LLVM/Clang
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_DIR }}
+          key: llvm-20.1.0-${{ runner.os }}-x64
+          restore-keys: |
+            llvm-20.1.0-${{ runner.os }}-
 
       - name: Install Clang/LLVM ${{ env.LLVM_VER }}
         run: |
           set -eux
-          curl -L -o llvm.tar.xz \
-            https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/clang+llvm-${LLVM_VER}-x86_64-linux-gnu-ubuntu-24.04.tar.xz
-          sudo mkdir -p ${LLVM_DIR}
-          sudo tar -xJf llvm.tar.xz -C /opt
-          # The tarball extracts to /opt/clang+llvm-<ver> — normalize to ${LLVM_DIR}
-          EXTRACTED_DIR=$(tar -tJf llvm.tar.xz | head -1 | cut -d/ -f1)
-          sudo mv "/opt/${EXTRACTED_DIR}" "${LLVM_DIR}"
+          if [ ! -d "${LLVM_DIR}/bin" ]; then
+            curl -L -o llvm.tar.xz \
+              https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/LLVM-${LLVM_VER}-Linux-X64.tar.xz
+            sudo mkdir -p ${LLVM_DIR}
+            sudo tar -xJf llvm.tar.xz -C ${LLVM_DIR} --strip-components=1
+          fi
           echo "${LLVM_DIR}/bin" >> $GITHUB_PATH
           ${LLVM_DIR}/bin/clang --version
 
@@ -57,30 +72,385 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: rust-ubuntu-24.04-v1
+          restore-keys: |
+            rust-ubuntu-24.04-
 
       - name: Install cargo-c helper
-        run: cargo install cargo-c --locked
+        run: |
+          export CARGO_HOME="$HOME/.cargo"
+          export RUSTUP_HOME="$HOME/.rustup"
+          cargo install cargo-c --locked
 
-      - name: Build & install libdovi (Dolby Vision C library)
+      - name: Cache libdovi build
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/libdovi*
+            /usr/local/include/dovi*
+            ~/.cargo/bin/dovi_tool
+            dovi_tool/target/release/dovi_tool
+            dovi_tool/
+          key: libdovi-ubuntu-24.04-v1
+          restore-keys: |
+            libdovi-ubuntu-24.04-
+
+      - name: Build & install libdovi (Dolby Vision C library) for Windows
+        run: |
+            set -eux
+            export CARGO_HOME="$HOME/.cargo"
+            export RUSTUP_HOME="$HOME/.rustup"
+            if [ ! -f "/usr/local/lib/libdovi.a" ] || [ ! -f "$HOME/.cargo/bin/dovi_tool" ]; then
+              if [ ! -d "dovi_tool" ]; then
+                git clone --depth=1 https://github.com/quietvoid/dovi_tool.git
+              fi
+              pushd dovi_tool/dolby_vision
+              # Cross-compile for Windows using MinGW
+              export CC=x86_64-w64-mingw32-gcc
+              export CXX=x86_64-w64-mingw32-g++
+              export AR=x86_64-w64-mingw32-ar
+              export PKG_CONFIG_ALLOW_CROSS=1
+              # Build as static library by setting the crate type
+              echo "=== Building dovi as static library ==="
+              # Create a temporary Cargo.toml to override the crate type
+              cp Cargo.toml Cargo.toml.bak
+              echo "=== Original Cargo.toml content ==="
+              cat Cargo.toml
+              # Add lib section to force static library build
+              # Check if [lib] section already exists and modify it, otherwise add it
+              if grep -q "^\[lib\]" Cargo.toml; then
+                # [lib] section exists, add crate-type to it
+                sed -i '/^\[lib\]/a crate-type = ["staticlib"]' Cargo.toml
+              else
+                # [lib] section doesn't exist, add it
+                echo "" >> Cargo.toml
+                echo "[lib]" >> Cargo.toml
+                echo 'crate-type = ["staticlib"]' >> Cargo.toml
+              fi
+              echo "=== Cargo.toml content after modification ==="
+              cat Cargo.toml
+              echo "=== Building dovi ==="
+              cargo build --release --target x86_64-pc-windows-gnu
+              echo "=== Build completed, checking for target directories ==="
+              find . -name "target" -type d
+              echo "=== Contents of any target directory ==="
+              find . -name "target" -type d -exec ls -la {} \;
+              echo "=== Looking for .a files in target directories ==="
+              find . -name "target" -type d -exec find {} -name "*.a" \;
+              # Restore original Cargo.toml
+              mv Cargo.toml.bak Cargo.toml
+              # Install headers and create pkg-config file
+              echo "=== Installing dovi headers ==="
+              sudo mkdir -p /usr/local/include/dovi
+              echo "Looking for header files in include/:"
+              ls -la include/ || echo "No include/ directory found"
+              sudo cp include/*.h /usr/local/include/dovi/ 2>/dev/null || true
+              echo "Headers installed to: /usr/local/include/dovi/"
+              ls -la /usr/local/include/dovi/ || echo "No headers found"
+              # Find and copy the Windows static library
+              echo "=== Looking for built dovi libraries ==="
+              echo "Searching in target/x86_64-pc-windows-gnu/release:"
+              find target/x86_64-pc-windows-gnu/release -name "*.a" -o -name "*.lib" | head -10
+              echo "Searching for dovi-specific files:"
+              find target/x86_64-pc-windows-gnu/release -name "*dovi*" -type f
+              echo "Searching in deps directory:"
+              find target/x86_64-pc-windows-gnu/release/deps -name "*.a" -o -name "*.lib" | head -10
+              # Find the actual static library file (it will have a hash-based name)
+              DOVI_LIB=$(find target/x86_64-pc-windows-gnu/release/deps -name "libdolby_vision*.a" | head -1)
+              if [ -n "$DOVI_LIB" ]; then
+                echo "Found dovi library at: $DOVI_LIB"
+                sudo cp "$DOVI_LIB" /usr/local/lib/libdovi.a
+                echo "Copied to: /usr/local/lib/libdovi.a"
+                ls -la /usr/local/lib/libdovi.a
+              else
+                echo "ERROR: Could not find dovi static library"
+                echo "All .a files in deps:"
+                find target/x86_64-pc-windows-gnu/release/deps -name "*.a" -exec ls -la {} \;
+                exit 1
+              fi
+              popd
+              # Build and install the dovi_tool CLI from local source (for Linux)
+              echo "=== Building dovi_tool CLI ==="
+              pushd dovi_tool
+              cargo build --release
+              echo "dovi_tool built at: target/release/dovi_tool"
+              cp target/release/dovi_tool $HOME/.cargo/bin/
+              echo "dovi_tool installed to: $HOME/.cargo/bin/dovi_tool"
+              ls -la $HOME/.cargo/bin/dovi_tool
+              popd
+              # Update library cache and verify installation
+              sudo ldconfig
+            elif [ -f "dovi_tool/target/release/dovi_tool" ] && [ ! -f "$HOME/.cargo/bin/dovi_tool" ]; then
+              # Copy cached binary if it exists in source but not in cargo bin
+              cp dovi_tool/target/release/dovi_tool $HOME/.cargo/bin/
+            fi
+            ldconfig -p | grep -i dovi || true
+            # Verify pkg-config files were created
+            echo "=== Checking for dovi pkg-config files ==="
+            find /usr/local -name "*.pc" | grep -i dovi || true
+            ls -la /usr/local/lib/pkgconfig/ || true
+
+      - name: Cache libhdr10plus build
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/lib/libhdr10plus*
+            /usr/local/include/hdr10plus*
+            hdr10plus_tool/
+          key: libhdr10plus-ubuntu-24.04-v1
+          restore-keys: |
+            libhdr10plus-ubuntu-24.04-
+
+      - name: Build & install libhdr10plus (HDR10+ C library) for Windows
+        run: |
+            set -eux
+            export CARGO_HOME="$HOME/.cargo"
+            export RUSTUP_HOME="$HOME/.rustup"
+            if [ ! -f "/usr/local/lib/libhdr10plus-rs.a" ]; then
+              if [ ! -d "hdr10plus_tool" ]; then
+                git clone --depth=1 https://github.com/quietvoid/hdr10plus_tool.git
+              fi
+              pushd hdr10plus_tool/hdr10plus
+              # Cross-compile for Windows using MinGW
+              export CC=x86_64-w64-mingw32-gcc
+              export CXX=x86_64-w64-mingw32-g++
+              export AR=x86_64-w64-mingw32-ar
+              export PKG_CONFIG_ALLOW_CROSS=1
+              # Build as static library by setting the crate type
+              echo "=== Building hdr10plus as static library ==="
+              # Create a temporary Cargo.toml to override the crate type
+              cp Cargo.toml Cargo.toml.bak
+              echo "=== Original Cargo.toml content ==="
+              cat Cargo.toml
+              # Replace the entire [lib] section to ensure static library build
+              # Remove existing [lib] section and add our own
+              sed -i '/^\[lib\]/,/^\[/ { /^\[lib\]/d; /^\[/!d; }' Cargo.toml
+              # Add our static library configuration
+              echo "" >> Cargo.toml
+              echo "[lib]" >> Cargo.toml
+              echo 'crate-type = ["staticlib"]' >> Cargo.toml
+              echo 'doctest = false' >> Cargo.toml
+              echo "=== Cargo.toml content after modification ==="
+              cat Cargo.toml
+              echo "=== Building hdr10plus ==="
+              cargo build --release --target x86_64-pc-windows-gnu
+              echo "=== Build completed, checking for target directories ==="
+              echo "Current working directory: $(pwd)"
+              find . -name "target" -type d
+              echo "=== Contents of any target directory ==="
+              find . -name "target" -type d -exec ls -la {} \;
+              echo "=== Looking for .a files in target directories ==="
+              find . -name "target" -type d -exec find {} -name "*.a" \;
+              echo "=== Checking if Windows target directory exists ==="
+              ls -la target/ 2>/dev/null || echo "No target directory found"
+              ls -la target/x86_64-pc-windows-gnu/ 2>/dev/null || echo "No Windows target directory found"
+              ls -la target/x86_64-pc-windows-gnu/release/ 2>/dev/null || echo "No Windows release directory found"
+              echo "=== Checking CARGO_TARGET_DIR ==="
+              echo "CARGO_TARGET_DIR: ${CARGO_TARGET_DIR:-not set}"
+              if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+                echo "Checking CARGO_TARGET_DIR location:"
+                ls -la "$CARGO_TARGET_DIR" 2>/dev/null || echo "CARGO_TARGET_DIR not found"
+                find "$CARGO_TARGET_DIR" -name "*.a" 2>/dev/null || echo "No .a files in CARGO_TARGET_DIR"
+              else
+                echo "CARGO_TARGET_DIR is not set, using default target directory"
+              fi
+              # Restore original Cargo.toml
+              mv Cargo.toml.bak Cargo.toml
+              # Install headers and create pkg-config file
+              echo "=== Installing hdr10plus headers ==="
+              sudo mkdir -p /usr/local/include/hdr10plus-rs
+              echo "Looking for header files in include/:"
+              ls -la include/ || echo "No include/ directory found"
+              sudo cp include/*.h /usr/local/include/hdr10plus-rs/ 2>/dev/null || true
+              echo "Headers installed to: /usr/local/include/hdr10plus-rs/"
+              ls -la /usr/local/include/hdr10plus-rs/ || echo "No headers found"
+              # Find and copy the Windows static library
+              echo "=== Looking for built hdr10plus libraries ==="
+              echo "Current directory: $(pwd)"
+              echo "Listing all target directories:"
+              find . -name "target" -type d
+              echo "Listing contents of any target directory:"
+              find . -name "target" -type d -exec ls -la {} \;
+              
+              # Check multiple possible locations for the static library
+              echo "=== Searching for hdr10plus static library ==="
+              
+              # First, try the standard location
+              if [ -d "target/x86_64-pc-windows-gnu/release" ]; then
+                echo "Found standard target directory, searching for .a files:"
+                find target/x86_64-pc-windows-gnu/release -name "*.a" -o -name "*.lib" | head -10
+                echo "Searching for hdr10plus-specific files:"
+                find target/x86_64-pc-windows-gnu/release -name "*hdr10plus*" -type f
+                echo "Searching in deps directory:"
+                find target/x86_64-pc-windows-gnu/release/deps -name "*.a" -o -name "*.lib" | head -10
+                HDR10PLUS_LIB=$(find target/x86_64-pc-windows-gnu/release/deps -name "libhdr10plus*.a" | head -1)
+              else
+                echo "Standard target directory not found, searching in all target directories:"
+                find . -name "target" -type d -exec find {} -name "libhdr10plus*.a" \;
+                HDR10PLUS_LIB=$(find . -name "target" -type d -exec find {} -name "libhdr10plus*.a" \; | head -1)
+              fi
+              
+              # If still not found, try searching more broadly
+              if [ -z "$HDR10PLUS_LIB" ]; then
+                echo "Not found in target directories, searching more broadly:"
+                find . -name "libhdr10plus*.a" -type f
+                HDR10PLUS_LIB=$(find . -name "libhdr10plus*.a" -type f | head -1)
+              fi
+              if [ -n "$HDR10PLUS_LIB" ]; then
+                echo "Found hdr10plus library at: $HDR10PLUS_LIB"
+                sudo cp "$HDR10PLUS_LIB" /usr/local/lib/libhdr10plus-rs.a
+                echo "Copied to: /usr/local/lib/libhdr10plus-rs.a"
+                ls -la /usr/local/lib/libhdr10plus-rs.a
+              else
+                echo "ERROR: Could not find hdr10plus static library"
+                echo "All .a files in deps:"
+                find target/x86_64-pc-windows-gnu/release/deps -name "*.a" -exec ls -la {} \;
+                exit 1
+              fi
+              popd
+              # Update library cache and verify installation
+              sudo ldconfig
+            fi
+            ldconfig -p | grep -i hdr10plus || true
+            # Verify pkg-config files were created
+            echo "=== Checking for hdr10plus pkg-config files ==="
+            find /usr/local -name "*.pc" | grep -i hdr10plus || true
+            ls -la /usr/local/lib/pkgconfig/ || true
+
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        with:
+          path: |
+            Build/linux/Release/CMakeCache.txt
+            Build/linux/Release/CMakeFiles/
+            Build/linux/Release/*.cmake
+          key: cmake-ubuntu-24.04-${{ hashFiles('**/CMakeLists.txt', '**/Source/**/*.c', '**/Source/**/*.h') }}
+          restore-keys: |
+            cmake-ubuntu-24.04-
+
+      - name: Configure + Build (PGO, DV, HDR10+) via upstream build.sh
         run: |
           set -eux
-          git clone --depth=1 https://github.com/quietvoid/dovi_tool.git
-          pushd dovi_tool/dolby_vision
-          cargo cinstall --release --prefix=/usr/local
-          popd
-          ldconfig -p | grep -i dovi || true
+          chmod +x Build/linux/build.sh
+          # Ensure pkg-config directory exists and has proper permissions
+          sudo mkdir -p /usr/local/lib/pkgconfig
+          sudo chmod 755 /usr/local/lib/pkgconfig
+          # Set library paths for proper detection
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          # Debug: Show what libraries and pkg-config files are available
+          echo "=== Debug: Library and pkg-config information ==="
+          echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
+          echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+          ls -la /usr/local/lib/ | grep -E "(dovi|hdr10plus)" || true
+          ls -la /usr/local/lib/pkgconfig/ | grep -E "(dovi|hdr10plus)" || true
+          pkg-config --list-all | grep -E "(dovi|hdr10plus)" || true
+          
+          # Create pkg-config files manually if they don't exist
+          echo "=== Creating pkg-config files ==="
+          if [ ! -f "/usr/local/lib/pkgconfig/dovi.pc" ]; then
+            echo "Creating dovi.pc manually..."
+            echo "prefix=/usr/local" | sudo tee /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "exec_prefix=\${prefix}" | sudo tee -a /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "libdir=\${exec_prefix}/lib" | sudo tee -a /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "includedir=\${prefix}/include" | sudo tee -a /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "" | sudo tee -a /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "Name: dovi" | sudo tee -a /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "Description: Dolby Vision metadata parsing and writing" | sudo tee -a /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "Version: 3.3.2" | sudo tee -a /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "Libs: -L\${libdir} -ldovi" | sudo tee -a /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "Cflags: -I\${includedir}" | sudo tee -a /usr/local/lib/pkgconfig/dovi.pc > /dev/null
+            echo "dovi.pc created at: /usr/local/lib/pkgconfig/dovi.pc"
+            cat /usr/local/lib/pkgconfig/dovi.pc
+          else
+            echo "dovi.pc already exists at: /usr/local/lib/pkgconfig/dovi.pc"
+            cat /usr/local/lib/pkgconfig/dovi.pc
+          fi
+          
+          if [ ! -f "/usr/local/lib/pkgconfig/hdr10plus-rs.pc" ]; then
+            echo "Creating hdr10plus-rs.pc manually..."
+            echo "prefix=/usr/local" | sudo tee /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "exec_prefix=\${prefix}" | sudo tee -a /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "libdir=\${exec_prefix}/lib" | sudo tee -a /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "includedir=\${prefix}/include" | sudo tee -a /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "" | sudo tee -a /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "Name: hdr10plus-rs" | sudo tee -a /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "Description: HDR10+ metadata parsing and writing" | sudo tee -a /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "Version: 2.1.4" | sudo tee -a /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "Libs: -L\${libdir} -lhdr10plus-rs" | sudo tee -a /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "Cflags: -I\${includedir}" | sudo tee -a /usr/local/lib/pkgconfig/hdr10plus-rs.pc > /dev/null
+            echo "hdr10plus-rs.pc created at: /usr/local/lib/pkgconfig/hdr10plus-rs.pc"
+            cat /usr/local/lib/pkgconfig/hdr10plus-rs.pc
+          else
+            echo "hdr10plus-rs.pc already exists at: /usr/local/lib/pkgconfig/hdr10plus-rs.pc"
+            cat /usr/local/lib/pkgconfig/hdr10plus-rs.pc
+          fi
+          
+          # Verify pkg-config files are now available
+          echo "=== Final pkg-config verification ==="
+          pkg-config --list-all | grep -E "(dovi|hdr10plus)" || true
+          
+          # Verify Windows static libraries are available
+          echo "=== Verifying Windows static libraries ==="
+          echo "Checking for libdovi.a:"
+          ls -la /usr/local/lib/libdovi.a || echo "libdovi.a not found"
+          echo "Checking for libhdr10plus-rs.a:"
+          ls -la /usr/local/lib/libhdr10plus-rs.a || echo "libhdr10plus-rs.a not found"
+          echo "All static libraries in /usr/local/lib/:"
+          ls -la /usr/local/lib/*.a || echo "No .a files found"
+          
+          # Use MinGW cross-compilation for Windows
+          Build/linux/build.sh release \
+            cc=x86_64-w64-mingw32-gcc cxx=x86_64-w64-mingw32-g++ enable-pgo enable-dovi enable-hdr10plus -- \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DCMAKE_C_FLAGS="${TARGET_CPU_FLAGS}" \
+            -DCMAKE_CXX_FLAGS="${TARGET_CPU_FLAGS}" \
+            -DCMAKE_PREFIX_PATH="/usr/local" \
+            -DCMAKE_LIBRARY_PATH="/usr/local/lib" \
+            -DCMAKE_INCLUDE_PATH="/usr/local/include"
 
-      - name: Build & install libhdr10plus (HDR10+ C library)
+      - name: Verify build artifacts exist
         run: |
           set -eux
-          git clone --depth=1 https://github.com/quietvoid/hdr10plus_tool.git
-          pushd hdr10plus_tool/hdr10plus
-          cargo cinstall --release --prefix=/usr/local
-          popd
-          ldconfig -p | grep -i hdr10plus || true
+          echo "=== Verifying build artifacts ==="
+          echo "Looking for main executable:"
+          ls -la Bin/Release/SvtAv1EncApp.exe || echo "SvtAv1EncApp.exe not found"
+          # Check that the main executable was built
+          if [ ! -f Bin/Release/SvtAv1EncApp.exe ]; then
+            echo "ERROR: SvtAv1EncApp.exe not found!"
+            echo "Contents of Bin/Release/:"
+            ls -la Bin/Release/ || echo "Bin/Release/ directory not found"
+            exit 1
+          fi
+          echo "Looking for shared library:"
+          ls -la Bin/Release/libSvtAv1Enc.dll || echo "libSvtAv1Enc.dll not found"
+          # Check that libraries were built
+          if [ ! -f Bin/Release/libSvtAv1Enc.dll ]; then
+            echo "ERROR: libSvtAv1Enc.dll not found!"
+            echo "Contents of Bin/Release/:"
+            ls -la Bin/Release/ || echo "Bin/Release/ directory not found"
+            exit 1
+          fi
+          echo "All build artifacts found:"
+          ls -la Bin/Release/
+          echo "Build artifacts verified successfully"
 
-      $1
-      - name: Smoketest (DV): generate RPU + short encode
+      - name: "Smoketest (DV): generate RPU + short encode"
         run: |
           set -eux
           mkdir -p smoke
@@ -94,22 +464,34 @@ jobs:
             | ./Bin/Release/SvtAv1EncApp -i stdin -b /dev/null --preset 8 --crf 40 --input-depth 10 \
               --dolby-vision-rpu smoke/RPU.bin -n 60
 
-      - name: Smoketest (HDR10+): flag present in CLI
+      - name: "Smoketest (HDR10+): flag present in CLI"
         run: |
           set -eux
           ./Bin/Release/SvtAv1EncApp --help | grep -i -- '--hdr10plus-json'
+
       - name: Collect build artifacts
         run: |
           set -eux
           mkdir -p out/bin out/lib
           # App
-          if [ -f Bin/Release/SvtAv1EncApp ]; then cp Bin/Release/SvtAv1EncApp out/bin/; fi
-          if [ -f Bin/Release/SvtAv1DecApp ]; then cp Bin/Release/SvtAv1DecApp out/bin/; fi
-          # Libraries (shared)
-          find . -maxdepth 3 -type f -name "libSvtAv1*so*" -exec cp {} out/lib/ \; || true
-          # Metadata libs (for convenience)
-          cp -a /usr/local/lib/libdovi* out/lib/ || true
-          cp -a /usr/local/lib/libhdr10plus* out/lib/ || true
+          if [ -f Bin/Release/SvtAv1EncApp ]; then 
+            cp Bin/Release/SvtAv1EncApp out/bin/
+            chmod +x out/bin/SvtAv1EncApp
+          fi
+          if [ -f Bin/Release/SvtAv1DecApp ]; then 
+            cp Bin/Release/SvtAv1DecApp out/bin/
+            chmod +x out/bin/SvtAv1DecApp
+          fi
+          # Libraries (shared) - look in the correct build directory
+          find Build/linux/Release -maxdepth 3 -type f -name "libSvtAv1*so*" -exec cp {} out/lib/ \; || true
+          # Also check for .dll files (Windows) and .dylib files (macOS)
+          find Build/linux/Release -maxdepth 3 -type f \( -name "libSvtAv1*.dll" -o -name "libSvtAv1*.dylib" \) -exec cp {} out/lib/ \; || true
+          # Windows static libraries (for convenience)
+          cp -a /usr/local/lib/libdovi.a out/lib/ 2>/dev/null || true
+          cp -a /usr/local/lib/libhdr10plus-rs.a out/lib/ 2>/dev/null || true
+          # Include headers
+          cp -a /usr/local/include/dovi out/include/ 2>/dev/null || true
+          cp -a /usr/local/include/hdr10plus-rs out/include/ 2>/dev/null || true
           # Usage notes
           cat > out/USAGE_DV_HDR10PLUS.txt <<'TXT'
           Example usage (inside the Release tarball):
@@ -123,10 +505,22 @@ jobs:
               --hdr10plus-json metadata.json
           TXT
 
+      - name: Verify collected artifacts
+        run: |
+          set -eux
+          echo "=== Collected artifacts ==="
+          find out -type f -exec ls -la {} \;
+          echo "=== Artifact count ==="
+          find out -type f | wc -l
+          if [ $(find out -type f | wc -l) -eq 0 ]; then
+            echo "ERROR: No artifacts collected!"
+            exit 1
+          fi
+
       - name: Tar up artifacts
         run: |
           set -eux
-          RELEASE_NAME="svt-av1-hdr-linux-clang${LLVM_VER}-znver5"
+            RELEASE_NAME="svt-av1-hdr-windows-clang${LLVM_VER}-znver4"
           mkdir -p dist
           tar -C out -cJf "dist/${RELEASE_NAME}.tar.xz" .
           echo "RELEASE_ASSET=dist/${RELEASE_NAME}.tar.xz" >> $GITHUB_ENV
@@ -147,12 +541,12 @@ jobs:
           name: ${{ steps.meta.outputs.tag }}
           draft: false
           prerelease: false
-          files: |
-            ${{ env.RELEASE_ASSET }}
+          files: ${{ env.RELEASE_ASSET }}
           body: |
             Build info:
+            - Target: Windows (MinGW cross-compilation)
             - Clang/LLVM: ${{ env.LLVM_VER }}
-            - CPU tuning: znver5
+            - CPU tuning: znver4
             - PGO: enabled
             - Dolby Vision (libdovi): enabled
             - HDR10+ (libhdr10plus): enabled
@@ -160,5 +554,5 @@ jobs:
       - name: Upload workflow artifact (CI)
         uses: actions/upload-artifact@v4
         with:
-          name: svt-av1-hdr-linux-${{ env.LLVM_VER }}-znver5
+          name: svt-av1-hdr-windows-${{ env.LLVM_VER }}-znver4
           path: ${{ env.RELEASE_ASSET }}
