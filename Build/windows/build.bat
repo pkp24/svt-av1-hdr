@@ -24,6 +24,14 @@ set "GENERATOR_ARG="
 set "vs="
 set "multi_config=1"
 set "pgo=OFF"
+set "cmake_eflags=%cmake_eflags% -DCMAKE_C_FLAGS="-O3 -march=znver4 -mtune=znver4 -pipe""
+set "cmake_eflags=%cmake_eflags% -DCMAKE_CXX_FLAGS="-O3 -march=znver4 -mtune=znver4 -pipe""
+set "PKGCONFIG_DIR=C:\msys64\clang64\lib\pkgconfig"
+set "PKGCONFIG_ADDED=0"
+set "MSYS_CLANG_BIN=C:\msys64\clang64\bin"
+set "MSYS_USR_BIN=C:\msys64\usr\bin"
+if exist "%MSYS_CLANG_BIN%\cmake.exe" set "PATH=%MSYS_CLANG_BIN%;%PATH%"
+if exist "%MSYS_USR_BIN%\sh.exe" set "PATH=%MSYS_USR_BIN%;%PATH%"
 :: (cmake -G 2>&1 | Select-String -SimpleMatch '*').Line.Split('=')[0].TrimEnd().Replace('* ','')
 :: Default is not building unit tests
 set "unittest=OFF"
@@ -209,7 +217,12 @@ if -%1-==-- (
     set "cmake_eflags=%cmake_eflags% -DENABLE_AVX512=OFF"
     shift
 ) else if /I "%1"=="enable-libdovi" (
+    call :ensure_pkgconfig
     set "cmake_eflags=%cmake_eflags% -DLIBDOVI_FOUND=1"
+    shift
+) else if /I "%1"=="enable-libhdr10plus" (
+    call :ensure_pkgconfig
+    set "cmake_eflags=%cmake_eflags% -DLIBHDR10PLUS_RS_FOUND=1"
     shift
 ) else if /I "%1"=="lto" (
     set "cmake_eflags=%cmake_eflags% -DSVT_AV1_LTO=ON"
@@ -231,8 +244,20 @@ if -%1-==-- (
 )
 goto :args
 
+:ensure_pkgconfig
+if "%PKGCONFIG_DIR%"=="" exit /b
+if not exist "%PKGCONFIG_DIR%" exit /b
+if "%PKGCONFIG_ADDED%"=="0" (
+    if "%PKG_CONFIG_PATH%"=="" (
+        set "PKG_CONFIG_PATH=%PKGCONFIG_DIR%"
+    ) else (
+        set "PKG_CONFIG_PATH=%PKGCONFIG_DIR%;%PKG_CONFIG_PATH%"
+    )
+    set "PKGCONFIG_ADDED=1"
+)
+exit /b
 :help
     echo Batch file to build SVT-AV1 on Windows
-    echo Usage: build.bat [2022^|2019^|2017^|2015^|clean] [release^|debug] [nobuild] [test] [shared^|static] [c-only] [no-avx512] [enable-libdovi] [lto] [pgo] [no-apps] [no-enc]
+    echo Usage: build.bat [2022^|2019^|2017^|2015^|clean] [release^|debug] [nobuild] [test] [shared^|static] [c-only] [no-avx512] [enable-libdovi] [enable-libhdr10plus] [lto] [pgo] [no-apps] [no-enc]
     exit /b 1
 goto :EOF
